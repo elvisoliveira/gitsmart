@@ -38,10 +38,12 @@ comparison.
 ## Install
 
 ```
-cargo install --root ~/.local --git ssh://git@github.com/elvisoliveira/gitsmart
+cargo install --git https://github.com/elvisoliveira/gitsmart
 ```
 
-(`~/.local/bin/gitsmart`. With a private repo and an SSH agent, set
-`CARGO_NET_GIT_FETCH_WITH_CLI=true`.) From a checkout: `cargo install --root ~/.local --path .`
-
 Run it inside a repository: `gitsmart`, or `GIT_ROOT=/path gitsmart`.
+
+## License
+
+MIT. `src/diff.rs` ports parts of [delta](https://github.com/dandavison/delta)
+(MIT, © Dan Davison); see [LICENSE](LICENSE).
