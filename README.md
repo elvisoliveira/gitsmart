@@ -46,4 +46,4 @@ Run it inside a repository: `gitsmart`, or `GIT_ROOT=/path gitsmart`.
 ## License
 
 MIT. `src/diff.rs` ports parts of [delta](https://github.com/dandavison/delta)
-(MIT, © Dan Davison); see [LICENSE](LICENSE).
+(MIT, © Dan Davison); see [LICENSE-delta](LICENSE-delta).
