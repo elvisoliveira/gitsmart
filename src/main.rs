@@ -12,9 +12,6 @@
 //! to first/last, C-d/u half-page. Moving through a list updates the diff.
 //! C-b or C-w then h/j/k/l switch panes, Tab cycles, C-b z zooms the pane, C-r
 //! reloads, C-g / C-b q quit.
-//! Inside a tmux float, C-z toggles the float between 85% and fullscreen (set
-//! TMUX_OUTER to the outer tmux's $TMUX).
-//!
 //! Needs only `git`: the side-by-side diff is rendered in-process (diff.rs).
 
 mod diff;
@@ -43,7 +40,7 @@ const SEL_FG: Color = Color::Indexed(254);
 const POINTER: Color = Color::Indexed(161);
 const PROMPT: Color = Color::Indexed(110);
 const INFO: Color = Color::Indexed(144);
-const HINTS: &str = " C-b hjkl: panes · type: filter · C-jk: scroll · C-du: page · C-b z: zoom · C-z: fullscreen · C-r: refresh · C-g/C-b q: quit ";
+const HINTS: &str = " C-b hjkl: panes · type: filter · C-jk: scroll · C-du: page · C-b z: zoom · C-r: refresh · C-g/C-b q: quit ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
@@ -152,8 +149,6 @@ struct App {
     lists: [List; 4],
     focus: Pane,
     zoom: bool,
-    /// Float grown to fullscreen (C-z) — independent of the pane zoom.
-    big: bool,
     /// 'b' after C-b, 'w' after C-w: the next h/j/k/l moves between panes.
     prefix: Option<char>,
     diff: DiffView,
@@ -425,24 +420,6 @@ fn layout(area: Rect, zoomed: Option<Pane>) -> Vec<(Pane, Rect)> {
     vec![(Worktree, wt), (Log, log), (Branches, br), (Tags, tags), (Diff, diff)]
 }
 
-/// Grow the float (a pane of the OUTER tmux) to fullscreen, or back to 85%.
-/// TMUX_OUTER (the outer tmux's $TMUX) is set by whoever opened the float.
-fn resize_float(zoomed: bool) {
-    let Ok(outer) = env::var("TMUX_OUTER") else { return };
-    let sock = outer.split(',').next().unwrap_or_default().to_string();
-    let tmux = |args: &[&str]| Command::new("tmux").arg("-S").arg(&sock).args(args).output().ok();
-    if zoomed {
-        tmux(&["resize-pane", "-x", "100%", "-y", "100%"]);
-    } else if let Some(o) = tmux(&["display", "-p", "#{window_width} #{window_height}"]) {
-        let s = String::from_utf8_lossy(&o.stdout);
-        let mut it = s.split_whitespace().filter_map(|n| n.parse::<u32>().ok());
-        if let (Some(w), Some(h)) = (it.next(), it.next()) {
-            tmux(&["resize-pane", "-x", &(w * 85 / 100).to_string(), "-y", &(h * 85 / 100).to_string()]);
-        }
-    }
-    tmux(&["move-pane", "-P", "center"]);
-}
-
 impl App {
     fn new(root: String, req: Sender<Req>) -> Self {
         let mut app = App {
@@ -451,7 +428,6 @@ impl App {
             lists: [List::new(false, "▶", " "), List::new(true, "▌", "▌"), List::new(true, "▌", "▌"), List::new(true, "▌", "▌")],
             focus: Worktree,
             zoom: false,
-            big: false,
             prefix: None,
             diff: DiffView { target: Target::Seed, lines: vec![], scroll: 0, height: 1, width: 0, req_width: 0 },
             rects: vec![],
@@ -525,11 +501,11 @@ impl App {
     }
 
     fn select(&mut self, p: Pane) {
-        self.set_zoom(false); // like tmux select-pane on a zoomed window
+        self.set_zoom(false); // moving off a zoomed pane unzooms it
         self.focus = p;
     }
 
-    /// Spatial pane move; wraps around at the edge like tmux select-pane.
+    /// Spatial pane move; wraps around at the edge.
     fn go(&mut self, dir: char) {
         if self.zoom {
             self.set_zoom(false);
@@ -573,10 +549,6 @@ impl App {
             KeyCode::Char('b') if ctrl => self.prefix = Some('b'),
             KeyCode::Char('w') if ctrl => self.prefix = Some('w'),
             KeyCode::Char('g') if ctrl => self.quit = true,
-            KeyCode::Char('z') if ctrl => {
-                self.big = !self.big;
-                resize_float(self.big);
-            }
             KeyCode::Char('r') if ctrl => self.reset(),
             KeyCode::Tab => self.select(ORDER[(self.focus.idx() + 1) % ORDER.len()]),
             _ if self.focus == Diff => self.diff_key(k.code, ctrl),

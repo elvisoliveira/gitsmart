@@ -32,12 +32,8 @@ comparison.
 | `⇧H/L` | first / last row |
 | `C-d`/`C-u` | half page |
 | `C-b z` | zoom the focused pane |
-| `C-z` | inside a tmux float: toggle the float between 85% and fullscreen |
 | `C-r` | reload everything |
 | `C-g`, `C-b q` | quit |
-
-`C-z` resizes the tmux pane the dashboard runs in, through the outer server
-named by `TMUX_OUTER` (that server's `$TMUX`); without it the key does nothing.
 
 ## Install
 
