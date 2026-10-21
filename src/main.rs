@@ -132,6 +132,8 @@ struct Data {
     status: Vec<(String, String)>,
     graph: Vec<String>,
     flat: Vec<String>,
+    /// Full hash of each `flat` row, so the log filter matches any hash prefix.
+    full: Vec<String>,
     branches: Vec<String>,
     tags: Vec<String>,
 }
@@ -214,6 +216,8 @@ fn hex_run(s: &str) -> Option<(usize, usize)> {
     None
 }
 
+const LOG_FMT: &str = "--pretty=format:%h %C(dim)%ad%C(reset)  %<(17,trunc)%an %C(auto)%d%C(reset)";
+
 fn load(root: &str) -> Data {
     let status = git(root, &["-c", "core.quotepath=false", "status", "--porcelain=v1", "--untracked-files=all"])
         .lines()
@@ -234,7 +238,7 @@ fn load(root: &str) -> Data {
     };
     let log = |graph: bool| {
         let mut args = vec!["-c", "core.abbrev=12", "-c", "color.ui=always", "log", "--color=always", "--date=format:%Y-%m-%d"];
-        args.push("--pretty=format:%h %C(dim)%ad%C(reset)  %<(17,trunc)%an %C(auto)%d%C(reset)");
+        args.push(LOG_FMT);
         args.extend(["-n", "300"]);
         if graph {
             args.push("--graph");
@@ -248,14 +252,15 @@ fn load(root: &str) -> Data {
             "--sort=-creatordate",
             "--color=always",
             kind,
-            "--format=%(align:20,left)%(refname:short)%(end) %(color:dim)%(objectname:short) %(committerdate:format:%Y-%m-%d)%(color:reset)",
+            "--format=%(refname:short)",
         ])
         .lines()
         .map(String::from)
         .collect()
     };
 
-    Data { status, graph: log(true), flat: log(false), branches: refs("refs/heads"), tags: refs("refs/tags") }
+    let full = git(root, &["log", "--format=%H", "-n", "300"]).lines().map(String::from).collect();
+    Data { status, graph: log(true), flat: log(false), full, branches: refs("refs/heads"), tags: refs("refs/tags") }
 }
 
 #[derive(Default)]
@@ -327,16 +332,22 @@ fn log_rows(d: &Data, query: &str) -> Vec<Row> {
             target: Some(Target::Seed),
         }
     });
-    head.into_iter().chain(src.iter()
-        .filter_map(|l| {
+    // Filtering uses `flat`, row-aligned with `full`; the graph is only shown unfiltered.
+    head.into_iter().chain(src.iter().enumerate()
+        .filter_map(|(i, l)| {
             let plain = strip_ansi(l);
-            if !plain.to_lowercase().contains(&q) {
+            let by_hash = is_hex(&q) && d.full.get(i).is_some_and(|h| h.starts_with(&q));
+            if !by_hash && !plain.to_lowercase().contains(&q) {
                 return None;
             }
             let target = hex_run(&plain).map(|(a, b)| Target::Commit(plain[a..b].to_string()));
             Some(Row { line: ansi_line(l), plain, target })
         }))
         .collect()
+}
+
+fn is_hex(q: &str) -> bool {
+    q.len() >= 4 && q.bytes().all(|c| c.is_ascii_hexdigit())
 }
 
 /// fzf-style fuzzy match: every query char appears, in order (case-insensitive).
@@ -459,7 +470,20 @@ impl App {
         let q = self.lists[p.idx()].query.clone();
         let (rows, total) = match p {
             Worktree => (worktree_rows(&self.data.status, &q), 0),
-            Log => (log_rows(&self.data, &q), 0),
+            Log => {
+                let mut rows = log_rows(&self.data, &q);
+                // A hash older than the 300 loaded commits: ask git for that one commit.
+                if q.len() >= 7 && is_hex(&q) && !rows.iter().any(|r| matches!(r.target, Some(Target::Commit(_)))) {
+                    let rev = format!("{}^{{commit}}", q.to_lowercase());
+                    let l = git(&self.root, &["-c", "core.abbrev=12", "-c", "color.ui=always", "log", "-1", "--color=always", "--date=format:%Y-%m-%d", LOG_FMT, &rev, "--"]);
+                    if let Some(l) = l.lines().next() {
+                        let plain = strip_ansi(l);
+                        let target = hex_run(&plain).map(|(a, b)| Target::Commit(plain[a..b].to_string()));
+                        rows.push(Row { line: ansi_line(l), plain, target });
+                    }
+                }
+                (rows, 0)
+            }
             Branches => (ref_rows(&self.data.branches, &q), self.data.branches.len()),
             Tags => (ref_rows(&self.data.tags, &q), self.data.tags.len()),
             Diff => return,
@@ -775,4 +799,20 @@ fn main() -> io::Result<()> {
     };
     restore();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_filter_matches_full_hash_prefix() {
+        let full = "0123456789abcdef0123456789abcdef01234567";
+        let d = Data { flat: vec!["0123456789ab 2026-01-01  me".into()], full: vec![full.into()], ..Default::default() };
+        let hit = |q: &str| log_rows(&d, q).iter().any(|r| r.target == Some(Target::Commit("0123456789ab".into())));
+        assert!(hit("0123456789ab"));    // short hash, as shown
+        assert!(hit(full));              // pasted full hash
+        assert!(hit("0123456789abcdef")); // longer than the shown abbrev
+        assert!(!hit("0123456789abcdee"));
+    }
 }

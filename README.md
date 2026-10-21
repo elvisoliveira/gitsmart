@@ -14,7 +14,9 @@ A read-only git dashboard for the terminal, in one binary that needs only `git`:
 
 Moving through the lists on the left updates the diff on the right. Unpushed
 commits get a bold-red hash. Typing filters the list under the cursor; the
-working tree keeps its tree shape while filtering, the log drops the graph. The
+working tree keeps its tree shape while filtering, the log drops the graph and
+also matches a commit hash (any prefix up to the full 40 chars, even past the
+300 commits it loads). Branches and tags list just the ref names. The
 log's first row, "Working Tree/Index", shows the uncommitted diff.
 
 The side-by-side diff is rendered in-process: a port of the part of
