@@ -9,7 +9,8 @@
 //!   └───────┴───────┴──────────────┘
 //!
 //! Lists filter as you type (lowercase); ⇧J/K, C-j/k and arrows move, ⇧H/L jump
-//! to first/last, C-d/u half-page. Moving through a list updates the diff.
+//! to first/last, C-d/u half-page. Moving through a list updates the diff;
+//! moving through branches also points the log at that branch.
 //! C-b or C-w then h/j/k/l switch panes, Tab cycles, C-b z zooms the pane, C-r
 //! reloads, C-g / C-b q quit.
 //! Needs only `git`: the side-by-side diff is rendered in-process (diff.rs).
@@ -130,12 +131,20 @@ struct DiffView {
 #[derive(Default)]
 struct Data {
     status: Vec<(String, String)>,
+    log: Log,
+    branches: Vec<String>,
+    tags: Vec<String>,
+    /// Checked-out branch ("" when detached).
+    current: String,
+}
+
+/// The log of one rev, in the two shapes the pane shows.
+#[derive(Default)]
+struct Log {
     graph: Vec<String>,
     flat: Vec<String>,
     /// Full hash of each `flat` row, so the log filter matches any hash prefix.
     full: Vec<String>,
-    branches: Vec<String>,
-    tags: Vec<String>,
 }
 
 struct Req {
@@ -143,6 +152,12 @@ struct Req {
     target: Target,
     width: u16,
     root: String,
+}
+
+struct LogReq {
+    gen: u64,
+    root: String,
+    rev: String,
 }
 
 struct App {
@@ -157,6 +172,10 @@ struct App {
     rects: Vec<(Pane, Rect)>,
     req: Sender<Req>,
     gen: u64,
+    /// Branch whose history the log shows; None = HEAD. Follows the branches pane.
+    log_ref: Option<String>,
+    log_req: Sender<LogReq>,
+    log_gen: u64,
     quit: bool,
 }
 
@@ -216,7 +235,38 @@ fn hex_run(s: &str) -> Option<(usize, usize)> {
     None
 }
 
-const LOG_FMT: &str = "--pretty=format:%h %C(dim)%ad%C(reset)  %<(17,trunc)%an %C(auto)%d%C(reset)";
+const LOG_FMT: &str = "%h %C(dim)%ad%C(reset)  %<(17,trunc)%an %C(auto)%d%C(reset)";
+
+/// One `git log --graph` read gives every shape the pane needs: each commit line
+/// carries its full hash before a \x1f, cut out of the graph and flat rows.
+fn load_log(root: &str, rev: &str) -> Log {
+    // Unpushed commits get a bold-red hash.
+    let unpushed: HashSet<String> =
+        git(root, &["rev-list", "--abbrev-commit", "--abbrev=12", rev, "--not", "--remotes"]).lines().map(String::from).collect();
+    let fmt = format!("--pretty=format:%H%x1f{LOG_FMT}");
+    let raw = git(root, &["-c", "core.abbrev=12", "-c", "color.ui=always", "log", "--graph", "--color=always", "--date=format:%Y-%m-%d", &fmt, "-n", "300", rev, "--"]);
+    parse_log(&raw, &unpushed)
+}
+
+fn parse_log(raw: &str, unpushed: &HashSet<String>) -> Log {
+    let recolor = |line: &str| match hex_run(line) {
+        Some((a, b)) if unpushed.contains(&line[a..b]) => format!("{}\x1b[1;31m{}\x1b[0m{}", &line[..a], &line[a..b], &line[b..]),
+        _ => line.to_string(),
+    };
+    let mut log = Log::default();
+    for line in raw.lines() {
+        match line.split_once('\x1f') {
+            Some((head, rest)) if head.len() >= 40 => {
+                let (glyphs, full) = head.split_at(head.len() - 40);
+                log.graph.push(recolor(&format!("{glyphs}{rest}")));
+                log.flat.push(recolor(rest));
+                log.full.push(full.to_string());
+            }
+            _ => log.graph.push(line.to_string()), // connector-only graph line
+        }
+    }
+    log
+}
 
 fn load(root: &str) -> Data {
     let status = git(root, &["-c", "core.quotepath=false", "status", "--porcelain=v1", "--untracked-files=all"])
@@ -228,23 +278,6 @@ fn load(root: &str) -> Data {
             (l[..2].trim().to_string(), path.to_string())
         })
         .collect();
-
-    // Unpushed commits get a bold-red hash.
-    let unpushed: HashSet<String> =
-        git(root, &["rev-list", "--abbrev-commit", "--abbrev=12", "HEAD", "--not", "--remotes"]).lines().map(String::from).collect();
-    let recolor = |line: &str| match hex_run(line) {
-        Some((a, b)) if unpushed.contains(&line[a..b]) => format!("{}\x1b[1;31m{}\x1b[0m{}", &line[..a], &line[a..b], &line[b..]),
-        _ => line.to_string(),
-    };
-    let log = |graph: bool| {
-        let mut args = vec!["-c", "core.abbrev=12", "-c", "color.ui=always", "log", "--color=always", "--date=format:%Y-%m-%d"];
-        args.push(LOG_FMT);
-        args.extend(["-n", "300"]);
-        if graph {
-            args.push("--graph");
-        }
-        git(root, &args).lines().map(|l| recolor(l)).collect::<Vec<_>>()
-    };
 
     let refs = |kind: &str| {
         git(root, &[
@@ -259,8 +292,8 @@ fn load(root: &str) -> Data {
         .collect()
     };
 
-    let full = git(root, &["log", "--format=%H", "-n", "300"]).lines().map(String::from).collect();
-    Data { status, graph: log(true), flat: log(false), full, branches: refs("refs/heads"), tags: refs("refs/tags") }
+    let current = git(root, &["branch", "--show-current"]).trim().to_string();
+    Data { status, log: load_log(root, "HEAD"), branches: refs("refs/heads"), tags: refs("refs/tags"), current }
 }
 
 #[derive(Default)]
@@ -318,13 +351,14 @@ fn worktree_rows(status: &[(String, String)], query: &str) -> Vec<Row> {
 }
 
 /// No query: the --graph tree. With one: a flat filtered list (filtering a graph
-/// would orphan its connector glyphs).
-fn log_rows(d: &Data, query: &str) -> Vec<Row> {
+/// would orphan its connector glyphs). `on_head`: the log shows HEAD, so the
+/// uncommitted-changes row belongs on top.
+fn log_rows(d: &Data, query: &str, on_head: bool) -> Vec<Row> {
     let q = query.to_lowercase();
-    let src = if q.is_empty() { &d.graph } else { &d.flat };
+    let src = if q.is_empty() { &d.log.graph } else { &d.log.flat };
     // Top entry: the uncommitted changes (worktree + index vs HEAD).
     let wt = "Working Tree/Index";
-    let head = (q.is_empty() || wt.to_lowercase().contains(&q)).then(|| {
+    let head = (on_head && (q.is_empty() || wt.to_lowercase().contains(&q))).then(|| {
         let note = if d.status.is_empty() { " (clean)".to_string() } else { format!(" ({} changed)", d.status.len()) };
         Row {
             line: Line::from(vec![Span::styled(format!("◌ {wt}"), Style::new().fg(Color::Yellow)), Span::styled(note, Style::new().add_modifier(Modifier::DIM))]),
@@ -336,7 +370,7 @@ fn log_rows(d: &Data, query: &str) -> Vec<Row> {
     head.into_iter().chain(src.iter().enumerate()
         .filter_map(|(i, l)| {
             let plain = strip_ansi(l);
-            let by_hash = is_hex(&q) && d.full.get(i).is_some_and(|h| h.starts_with(&q));
+            let by_hash = is_hex(&q) && d.log.full.get(i).is_some_and(|h| h.starts_with(&q));
             if !by_hash && !plain.to_lowercase().contains(&q) {
                 return None;
             }
@@ -356,7 +390,8 @@ fn fuzzy(hay: &str, query: &str) -> bool {
     query.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).all(|c| h.any(|x| x == c))
 }
 
-fn ref_rows(lines: &[String], query: &str) -> Vec<Row> {
+/// `current`: the checked-out branch, marked `*` ("" for tags: no marks).
+fn ref_rows(lines: &[String], query: &str, current: &str) -> Vec<Row> {
     lines
         .iter()
         .filter_map(|l| {
@@ -365,8 +400,13 @@ fn ref_rows(lines: &[String], query: &str) -> Vec<Row> {
                 return None;
             }
             let name = plain.split_whitespace().next().unwrap_or("").to_string();
+            let mut line = ansi_line(l);
+            if !current.is_empty() {
+                let mark = if name == current { Span::styled("* ", Style::new().fg(Color::Green)) } else { Span::raw("  ") };
+                line.spans.insert(0, mark);
+            }
             let target = (!name.is_empty()).then_some(Target::Commit(name));
-            Some(Row { line: ansi_line(l), plain, target })
+            Some(Row { line, plain, target })
         })
         .collect()
 }
@@ -407,17 +447,22 @@ fn render_diff(root: &str, target: &Target, width: u16) -> Vec<Line<'static>> {
     }
 }
 
-/// Renders diffs off the UI thread; only the newest pending request is served,
-/// so fast navigation never queues up slow renders.
-fn worker(rx: Receiver<Req>, tx: Sender<(u64, Vec<Line<'static>>)>) {
-    while let Ok(mut r) = rx.recv() {
-        while let Ok(newer) = rx.try_recv() {
-            r = newer;
+/// Runs `f` off the UI thread; only the newest pending request is served, so
+/// fast navigation never queues up slow work (diff renders, log loads).
+fn spawn_latest<T: Send + 'static, R: Send + 'static>(f: impl Fn(T) -> R + Send + 'static) -> (Sender<T>, Receiver<R>) {
+    let (tx, rx) = mpsc::channel::<T>();
+    let (res_tx, res_rx) = mpsc::channel();
+    thread::spawn(move || {
+        while let Ok(mut r) = rx.recv() {
+            while let Ok(newer) = rx.try_recv() {
+                r = newer;
+            }
+            if res_tx.send(f(r)).is_err() {
+                break;
+            }
         }
-        if tx.send((r.gen, render_diff(&r.root, &r.target, r.width))).is_err() {
-            break;
-        }
-    }
+    });
+    (tx, res_rx)
 }
 
 fn layout(area: Rect, zoomed: Option<Pane>) -> Vec<(Pane, Rect)> {
@@ -432,7 +477,7 @@ fn layout(area: Rect, zoomed: Option<Pane>) -> Vec<(Pane, Rect)> {
 }
 
 impl App {
-    fn new(root: String, req: Sender<Req>) -> Self {
+    fn new(root: String, req: Sender<Req>, log_req: Sender<LogReq>) -> Self {
         let mut app = App {
             root,
             data: Data::default(),
@@ -444,6 +489,9 @@ impl App {
             rects: vec![],
             req,
             gen: 0,
+            log_ref: None,
+            log_req,
+            log_gen: 0,
             quit: false,
         };
         app.reset();
@@ -453,12 +501,16 @@ impl App {
     /// Fresh load: what respawning every pane did (queries and cursors reset).
     fn reset(&mut self) {
         self.data = load(&self.root);
+        self.log_ref = None;
+        self.log_gen += 1; // drop a branch log still loading
         for p in [Worktree, Log, Branches, Tags] {
             self.lists[p.idx()].query.clear();
             self.rebuild(p);
             let l = &mut self.lists[p.idx()];
             l.focused = l.current().map(|r| r.plain.clone());
         }
+        let current = self.data.current.clone();
+        self.point_branches_at(&current);
         // The diff opens on the first worktree row if it is a file, else on the
         // whole working-tree diff (HEAD when clean). Log/branches/tags don't
         // drive it until you move in them.
@@ -471,11 +523,23 @@ impl App {
         let (rows, total) = match p {
             Worktree => (worktree_rows(&self.data.status, &q), 0),
             Log => {
-                let mut rows = log_rows(&self.data, &q);
-                // A hash older than the 300 loaded commits: ask git for that one commit.
-                if q.len() >= 7 && is_hex(&q) && !rows.iter().any(|r| matches!(r.target, Some(Target::Commit(_)))) {
+                let mut rows = log_rows(&self.data, &q, self.log_ref.is_none());
+                let found = |rows: &[Row]| rows.iter().any(|r| matches!(r.target, Some(Target::Commit(_))));
+                // A hash not in the loaded log: show the local branch holding it, so
+                // the row is a real log row (and Esc keeps it). Else ask git for
+                // that one commit (remote-only, or past the 300 loaded).
+                if q.len() >= 7 && is_hex(&q) && !found(&rows) {
                     let rev = format!("{}^{{commit}}", q.to_lowercase());
-                    let l = git(&self.root, &["-c", "core.abbrev=12", "-c", "color.ui=always", "log", "-1", "--color=always", "--date=format:%Y-%m-%d", LOG_FMT, &rev, "--"]);
+                    if let Some(b) = self.branch_containing(&rev) {
+                        self.point_branches_at(&b);
+                        self.show_log_of(&b, true);
+                        rows = log_rows(&self.data, &q, self.log_ref.is_none());
+                    }
+                }
+                if q.len() >= 7 && is_hex(&q) && !found(&rows) {
+                    let rev = format!("{}^{{commit}}", q.to_lowercase());
+                    let fmt = format!("--pretty=format:{LOG_FMT}");
+                    let l = git(&self.root, &["-c", "core.abbrev=12", "-c", "color.ui=always", "log", "-1", "--color=always", "--date=format:%Y-%m-%d", &fmt, &rev, "--"]);
                     if let Some(l) = l.lines().next() {
                         let plain = strip_ansi(l);
                         let target = hex_run(&plain).map(|(a, b)| Target::Commit(plain[a..b].to_string()));
@@ -484,8 +548,8 @@ impl App {
                 }
                 (rows, 0)
             }
-            Branches => (ref_rows(&self.data.branches, &q), self.data.branches.len()),
-            Tags => (ref_rows(&self.data.tags, &q), self.data.tags.len()),
+            Branches => (ref_rows(&self.data.branches, &q, &self.data.current), self.data.branches.len()),
+            Tags => (ref_rows(&self.data.tags, &q, ""), self.data.tags.len()),
             Diff => return,
         };
         let l = &mut self.lists[p.idx()];
@@ -502,12 +566,65 @@ impl App {
         if cur == l.focused {
             return;
         }
-        l.focused = cur;
+        l.focused = cur.clone();
         if let Some(t) = l.current().and_then(|r| r.target.clone()) {
             if t != self.diff.target {
                 self.diff.target = t;
                 self.request_diff();
             }
+        }
+        if let (Branches, Some(b)) = (p, cur) {
+            self.show_log_of(&b, false);
+        }
+    }
+
+    /// Point the log at a branch: the checked-out one means HEAD (with the
+    /// working-tree row). Async while navigating branches; sync for a hash
+    /// search, which needs the rows right away.
+    fn show_log_of(&mut self, branch: &str, now: bool) {
+        let r = (branch != self.data.current).then(|| branch.to_string());
+        if r == self.log_ref {
+            return;
+        }
+        self.log_ref = r;
+        self.log_gen += 1;
+        let rev = self.log_ref.as_ref().map_or("HEAD".to_string(), |b| format!("refs/heads/{b}"));
+        if now {
+            self.data.log = load_log(&self.root, &rev);
+        } else {
+            let _ = self.log_req.send(LogReq { gen: self.log_gen, root: self.root.clone(), rev });
+        }
+    }
+
+    /// A branch log finished loading in the background.
+    fn set_log(&mut self, gen: u64, log: Log) {
+        if gen != self.log_gen {
+            return;
+        }
+        self.data.log = log;
+        self.rebuild(Log);
+        let l = &mut self.lists[Log.idx()];
+        l.focused = l.current().map(|r| r.plain.clone());
+    }
+
+    /// Local branch holding a commit: the checked-out one if it does, else the
+    /// most recent (the branches pane's order).
+    fn branch_containing(&self, rev: &str) -> Option<String> {
+        let has: HashSet<String> = git(&self.root, &["for-each-ref", "--contains", rev, "--format=%(refname:short)", "refs/heads"]).lines().map(String::from).collect();
+        let d = &self.data;
+        if has.contains(&d.current) {
+            return Some(d.current.clone());
+        }
+        d.branches.iter().map(|l| strip_ansi(l)).find(|b| has.contains(b))
+    }
+
+    /// Put the branches cursor on a branch without moving the diff (no-op when
+    /// it is filtered out).
+    fn point_branches_at(&mut self, branch: &str) {
+        let l = &mut self.lists[Branches.idx()];
+        if let Some(i) = l.rows.iter().position(|r| r.plain == branch) {
+            l.cursor = i;
+            l.focused = Some(branch.to_string());
         }
     }
 
@@ -622,13 +739,21 @@ impl App {
             // Clear the filter but stay on the same row. Matched by target, since a
             // log row's text differs between the flat (filtered) and graph views.
             KeyCode::Esc if !l.query.is_empty() => {
+                let (query, cursor) = (std::mem::take(&mut l.query), l.cursor);
                 let sel = l.current().map(|r| (r.target.clone(), r.plain.clone()));
-                l.query.clear();
                 self.rebuild(p);
                 let l = &mut self.lists[p.idx()];
-                if let Some((target, plain)) = sel {
-                    let i = l.rows.iter().position(|r| if target.is_some() { r.target == target } else { r.plain == plain });
-                    l.cursor = i.unwrap_or(0);
+                let found = sel.map(|(target, plain)| l.rows.iter().position(|r| if target.is_some() { r.target == target } else { r.plain == plain }));
+                match found {
+                    Some(Some(i)) => l.cursor = i,
+                    // Not in the unfiltered list (remote-only, or past the 300
+                    // loaded): keep the filter rather than lose the row.
+                    Some(None) => {
+                        l.query = query;
+                        self.rebuild(p);
+                        self.lists[p.idx()].cursor = cursor;
+                    }
+                    None => {}
                 }
             }
             KeyCode::Char(c) if !ctrl => {
@@ -650,7 +775,11 @@ impl App {
                 borders |= Borders::LEFT;
             }
             let style = Style::new().fg(if active { ACTIVE } else { BORDER });
-            let block = Block::new().borders(borders).border_style(style).title(Span::styled(format!(" {} ", p.title()), style));
+            let title = match (p, &self.log_ref) {
+                (Log, Some(b)) => format!(" log · {b} "),
+                _ => format!(" {} ", p.title()),
+            };
+            let block = Block::new().borders(borders).border_style(style).title(Span::styled(title, style));
             let inner = block.inner(r);
             f.render_widget(block, r);
             match p {
@@ -761,10 +890,9 @@ fn main() -> io::Result<()> {
         std::process::exit(1);
     }
 
-    let (req_tx, req_rx) = mpsc::channel();
-    let (res_tx, res_rx) = mpsc::channel();
-    thread::spawn(move || worker(req_rx, res_tx));
-    let mut app = App::new(root, req_tx);
+    let (req_tx, res_rx) = spawn_latest(|r: Req| (r.gen, render_diff(&r.root, &r.target, r.width)));
+    let (log_tx, log_rx) = spawn_latest(|r: LogReq| (r.gen, load_log(&r.root, &r.rev)));
+    let mut app = App::new(root, req_tx, log_tx);
 
     terminal::enable_raw_mode()?;
     execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide)?;
@@ -801,6 +929,10 @@ fn main() -> io::Result<()> {
             Ok(false) => {}
             Err(e) => break Err(e),
         }
+        while let Ok((gen, log)) = log_rx.try_recv() {
+            app.set_log(gen, log);
+            dirty = true;
+        }
         while let Ok((gen, lines)) = res_rx.try_recv() {
             if gen == app.gen {
                 app.diff.lines = lines;
@@ -817,11 +949,30 @@ fn main() -> io::Result<()> {
 mod tests {
     use super::*;
 
+    fn app(root: &str) -> App {
+        let (tx, _) = mpsc::channel();
+        let (log_tx, _) = mpsc::channel();
+        App::new(root.into(), tx, log_tx)
+    }
+
+    fn key(app: &mut App, c: KeyCode) {
+        app.on_key(KeyEvent::new(c, KeyModifiers::NONE));
+    }
+
+    fn typed(app: &mut App, s: &str) {
+        s.chars().for_each(|c| key(app, KeyCode::Char(c)));
+    }
+
+    fn selected(app: &App, p: Pane) -> Option<Target> {
+        app.lists[p.idx()].current().and_then(|r| r.target.clone())
+    }
+
     #[test]
     fn log_filter_matches_full_hash_prefix() {
         let full = "0123456789abcdef0123456789abcdef01234567";
-        let d = Data { flat: vec!["0123456789ab 2026-01-01  me".into()], full: vec![full.into()], ..Default::default() };
-        let hit = |q: &str| log_rows(&d, q).iter().any(|r| r.target == Some(Target::Commit("0123456789ab".into())));
+        let log = Log { flat: vec!["0123456789ab 2026-01-01  me".into()], full: vec![full.into()], ..Default::default() };
+        let d = Data { log, ..Default::default() };
+        let hit = |q: &str| log_rows(&d, q, true).iter().any(|r| r.target == Some(Target::Commit("0123456789ab".into())));
         assert!(hit("0123456789ab"));    // short hash, as shown
         assert!(hit(full));              // pasted full hash
         assert!(hit("0123456789abcdef")); // longer than the shown abbrev
@@ -829,21 +980,66 @@ mod tests {
     }
 
     #[test]
+    fn parse_log_splits_graph_flat_and_full_hash() {
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let raw = format!("* {a}\x1f{} first\n|\\\n| * {b}\x1f{} second", &a[..12], &b[..12]);
+        let log = parse_log(&raw, &HashSet::new());
+        assert_eq!(log.graph, [format!("* {} first", &a[..12]), "|\\".into(), format!("| * {} second", &b[..12])]);
+        assert_eq!(log.flat, [format!("{} first", &a[..12]), format!("{} second", &b[..12])]);
+        assert_eq!(log.full, [a, b]);
+    }
+
+    #[test]
     fn esc_clears_filter_and_keeps_the_row() {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = App::new("/nonexistent".into(), tx);
+        let mut app = app("/nonexistent");
         let (a, b) = ("aaaaaaaaaaaa", "bbbbbbbbbbbb");
-        app.data.graph = vec![format!("* {a} first"), format!("* {b} second")];
-        app.data.flat = vec![format!("{a} first"), format!("{b} second")];
-        app.data.full = vec![a.repeat(4)[..40].into(), b.repeat(4)[..40].into()];
+        app.data.log = Log {
+            graph: vec![format!("* {a} first"), format!("* {b} second")],
+            flat: vec![format!("{a} first"), format!("{b} second")],
+            full: vec![a.repeat(4)[..40].into(), b.repeat(4)[..40].into()],
+        };
         app.focus = Log;
-        let key = |app: &mut App, c| app.on_key(KeyEvent::new(c, KeyModifiers::NONE));
-        for c in "second".chars() {
-            key(&mut app, KeyCode::Char(c));
-        }
+        typed(&mut app, "second");
         key(&mut app, KeyCode::Esc);
-        let l = &app.lists[Log.idx()];
-        assert!(l.query.is_empty());
-        assert!(l.current().and_then(|r| r.target.clone()) == Some(Target::Commit(b.into())));
+        assert!(app.lists[Log.idx()].query.is_empty());
+        assert!(selected(&app, Log) == Some(Target::Commit(b.into())));
+    }
+
+    /// The reported case: a hash that only lives on another local branch.
+    #[test]
+    fn hash_on_another_branch_moves_branches_and_survives_esc() {
+        let dir = std::env::temp_dir().join(format!("gitsmart-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.to_str().unwrap();
+        let run = |args: &[&str]| {
+            let ok = Command::new("git").arg("-C").arg(root).args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]).args(args)
+                .stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap().success();
+            assert!(ok, "git {args:?}");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        run(&["checkout", "-q", "-b", "other"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "only on other"]);
+        run(&["checkout", "-q", "main"]);
+        let hash = git(root, &["rev-parse", "other"]).trim().to_string();
+
+        let mut app = app(root);
+        assert!(app.log_ref.is_none());
+        app.focus = Log;
+        typed(&mut app, &hash[..9]);
+        assert_eq!(app.log_ref.as_deref(), Some("other"));
+        assert!(selected(&app, Branches) == Some(Target::Commit("other".into())));
+        key(&mut app, KeyCode::Esc);
+        assert!(app.lists[Log.idx()].query.is_empty());
+        assert!(selected(&app, Log) == Some(Target::Commit(hash[..12].into())));
+
+        // Back on the checked-out branch: the log is HEAD again, working tree on top.
+        app.point_branches_at("main");
+        app.show_log_of("main", true);
+        app.rebuild(Log);
+        assert!(app.log_ref.is_none());
+        assert!(selected(&app, Log) == Some(Target::Seed));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

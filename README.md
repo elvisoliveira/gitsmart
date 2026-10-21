@@ -16,7 +16,11 @@ Moving through the lists on the left updates the diff on the right. Unpushed
 commits get a bold-red hash. Typing filters the list under the cursor; the
 working tree keeps its tree shape while filtering, the log drops the graph and
 also matches a commit hash (any prefix up to the full 40 chars, even past the
-300 commits it loads). Branches and tags list just the ref names. The
+300 commits it loads). Branches and tags list just the ref names; the
+checkout is marked `*`. The log follows the branches pane: moving there shows
+that branch's history (the title names it), and back on `*` it is HEAD again,
+with the working-tree row. A hash that only lives on another local branch moves
+the branches pane there, so the commit sits in its own history. The
 log's first row, "Working Tree/Index", shows the uncommitted diff.
 
 The side-by-side diff is rendered in-process: a port of the part of
