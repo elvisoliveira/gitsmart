@@ -33,6 +33,7 @@ comparison.
 | `⇧J/K`, `C-j/k`, arrows | move the list / scroll the diff |
 | `⇧H/L` | first / last row |
 | `C-d`/`C-u` | half page |
+| `Esc` | clear the filter, keeping the selected row |
 | `C-b z` | zoom the focused pane |
 | `C-r` | reload everything |
 | `C-g`, `C-b q` | quit |

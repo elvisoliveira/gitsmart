@@ -40,7 +40,7 @@ const SEL_FG: Color = Color::Indexed(254);
 const POINTER: Color = Color::Indexed(161);
 const PROMPT: Color = Color::Indexed(110);
 const INFO: Color = Color::Indexed(144);
-const HINTS: &str = " C-b hjkl: panes · type: filter · C-jk: scroll · C-du: page · C-b z: zoom · C-r: refresh · C-g/C-b q: quit ";
+const HINTS: &str = " C-b hjkl: panes · type: filter · Esc: clear · C-jk: scroll · C-du: page · C-b z: zoom · C-r: refresh · C-g/C-b q: quit ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
@@ -619,6 +619,18 @@ impl App {
                     self.rebuild(p);
                 }
             }
+            // Clear the filter but stay on the same row. Matched by target, since a
+            // log row's text differs between the flat (filtered) and graph views.
+            KeyCode::Esc if !l.query.is_empty() => {
+                let sel = l.current().map(|r| (r.target.clone(), r.plain.clone()));
+                l.query.clear();
+                self.rebuild(p);
+                let l = &mut self.lists[p.idx()];
+                if let Some((target, plain)) = sel {
+                    let i = l.rows.iter().position(|r| if target.is_some() { r.target == target } else { r.plain == plain });
+                    l.cursor = i.unwrap_or(0);
+                }
+            }
             KeyCode::Char(c) if !ctrl => {
                 l.query.push(c);
                 self.rebuild(p);
@@ -814,5 +826,24 @@ mod tests {
         assert!(hit(full));              // pasted full hash
         assert!(hit("0123456789abcdef")); // longer than the shown abbrev
         assert!(!hit("0123456789abcdee"));
+    }
+
+    #[test]
+    fn esc_clears_filter_and_keeps_the_row() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new("/nonexistent".into(), tx);
+        let (a, b) = ("aaaaaaaaaaaa", "bbbbbbbbbbbb");
+        app.data.graph = vec![format!("* {a} first"), format!("* {b} second")];
+        app.data.flat = vec![format!("{a} first"), format!("{b} second")];
+        app.data.full = vec![a.repeat(4)[..40].into(), b.repeat(4)[..40].into()];
+        app.focus = Log;
+        let key = |app: &mut App, c| app.on_key(KeyEvent::new(c, KeyModifiers::NONE));
+        for c in "second".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Esc);
+        let l = &app.lists[Log.idx()];
+        assert!(l.query.is_empty());
+        assert!(l.current().and_then(|r| r.target.clone()) == Some(Target::Commit(b.into())));
     }
 }
