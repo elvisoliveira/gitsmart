@@ -411,12 +411,60 @@ fn ref_rows(lines: &[String], query: &str, current: &str) -> Vec<Row> {
         .collect()
 }
 
+/// Everything in the commit object (`git show --format=raw`: tree, parents,
+/// author, committer, signature, ...) plus readable dates and the refs, then
+/// the message.
+fn commit_header(root: &str, rev: &str) -> Vec<Line<'static>> {
+    let info = git(root, &["show", "-s", "--date=format:%Y-%m-%d %H:%M %z", "--format=%ad%x00%cd%x00%d", rev]);
+    let mut info = info.trim_end_matches('\n').split('\0');
+    let mut next = || info.next().unwrap_or("").to_string();
+    let (ad, cd, refs) = (next(), next(), next());
+    header_lines(&git(root, &["show", "-s", "--format=raw", rev]), &ad, &cd, &refs)
+}
+
+/// Multi-line headers (gpgsig, mergetag) fold to one line; the signature is
+/// only named, never verified (that needs gpg and its keys).
+fn header_lines(raw: &str, ad: &str, cd: &str, refs: &str) -> Vec<Line<'static>> {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let yellow = Style::new().fg(Color::Yellow);
+    let mut lines = vec![];
+    let mut it = raw.lines().peekable();
+    while let Some(l) = it.next() {
+        if l.is_empty() {
+            lines.push(Line::default());
+            lines.extend(it.map(|m| Line::raw(m.to_string())));
+            break;
+        }
+        let (key, val) = l.split_once(' ').unwrap_or((l, ""));
+        let mut more = 0;
+        while it.next_if(|n| n.starts_with(' ')).is_some() {
+            more += 1;
+        }
+        let mut spans = vec![Span::styled(format!("{key:<9} "), Style::new().fg(Color::Blue))];
+        match key {
+            "commit" => spans.extend([Span::styled(val.to_string(), yellow), Span::styled(refs.to_string(), yellow)]),
+            "author" | "committer" => {
+                let date = if key == "author" { ad } else { cd };
+                spans.extend([Span::raw(val.to_string()), Span::styled(format!("  ({date})"), dim)]);
+            }
+            k if k.starts_with("gpgsig") => {
+                let kind = val.trim_start_matches("-----BEGIN ").trim_end_matches("-----");
+                spans.push(Span::raw(format!("{kind}, {} lines, not verified", more + 1)));
+            }
+            _ if more > 0 => spans.push(Span::raw(format!("{val} (+{more} lines)"))),
+            _ => spans.push(Span::raw(val.to_string())),
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
 fn render_diff(root: &str, target: &Target, width: u16) -> Vec<Line<'static>> {
     let non_empty = |s: String| (!s.trim().is_empty()).then_some(s);
     // A commit: git's own coloured header (commit/Author/Date/message) as-is,
     // then its patch side by side — what delta did with `git show` output.
     let commit = |rev: &str| {
-        let mut lines = git(root, &["show", "-s", "--color=always", rev]).into_text().map(|t| t.lines).unwrap_or_default();
+        let mut lines = commit_header(root, rev);
         let patch = git(root, &["show", "--no-color", "--format=", rev]);
         if !patch.trim().is_empty() {
             lines.push(Line::default());
@@ -1003,6 +1051,27 @@ mod tests {
         key(&mut app, KeyCode::Esc);
         assert!(app.lists[Log.idx()].query.is_empty());
         assert!(selected(&app, Log) == Some(Target::Commit(b.into())));
+    }
+
+    #[test]
+    fn header_shows_every_field_and_folds_the_signature() {
+        let raw = "commit abc\ntree t1\nparent p1\nparent p2\nauthor A <a@a> 1791364891 +0100\ncommitter C <c@c> 1791364900 +0100\n\
+                   gpgsig -----BEGIN PGP SIGNATURE-----\n \n xyz\n -----END PGP SIGNATURE-----\n\n    subject\n\n    body";
+        let text: Vec<String> = header_lines(raw, "2026-10-07 10:21 +0100", "2026-10-07 10:22 +0100", " (HEAD -> main)")
+            .iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+        assert_eq!(text, [
+            "commit    abc (HEAD -> main)",
+            "tree      t1",
+            "parent    p1",
+            "parent    p2",
+            "author    A <a@a> 1791364891 +0100  (2026-10-07 10:21 +0100)",
+            "committer C <c@c> 1791364900 +0100  (2026-10-07 10:22 +0100)",
+            "gpgsig    PGP SIGNATURE, 4 lines, not verified",
+            "",
+            "    subject",
+            "",
+            "    body",
+        ]);
     }
 
     /// The reported case: a hash that only lives on another local branch.

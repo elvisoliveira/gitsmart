@@ -23,6 +23,10 @@ with the working-tree row. A hash that only lives on another local branch moves
 the branches pane there, so the commit sits in its own history. The
 log's first row, "Working Tree/Index", shows the uncommitted diff.
 
+A commit's diff opens with its whole object header (tree, parents, author,
+committer, signature, …), dates also shown readable and the signature folded to
+one line (named, not verified).
+
 The side-by-side diff is rendered in-process: a port of the part of
 [delta](https://github.com/dandavison/delta) used here (`--side-by-side
 --wrap-max-lines 0 --dark`), checked to match delta's output cell for cell.
