@@ -50,6 +50,7 @@ comparison.
 | `C-d`/`C-u` | half page |
 | `Esc` | clear the filter, keeping the selected row |
 | `C-b z` | zoom the focused pane |
+| `w` (diff pane) | toggle wrapping long lines |
 | `C-r` | reload everything |
 | `C-g`, `C-b q` | quit |
 

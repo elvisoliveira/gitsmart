@@ -13,7 +13,7 @@
 //! moving through branches also points the log at that branch.
 //! C-b or C-w then h/j/k/l switch panes, Tab switches the pane's tab (branches:
 //! local/remote, tags: tags/stashes, diff: diff/properties), C-b z zooms the
-//! pane, C-r reloads, C-g / C-b q quit.
+//! pane, w (in the diff) toggles wrapping long lines, C-r reloads, C-g / C-b q quit.
 //! Needs only `git`: the side-by-side diff is rendered in-process (diff.rs).
 
 mod diff;
@@ -42,7 +42,7 @@ const SEL_FG: Color = Color::Indexed(254);
 const POINTER: Color = Color::Indexed(161);
 const PROMPT: Color = Color::Indexed(110);
 const INFO: Color = Color::Indexed(144);
-const HINTS: &str = " C-b hjkl: panes · Tab: tab · type: filter · Esc: clear · C-jk: scroll · C-du: page · C-b z: zoom · C-r: refresh · C-g/C-b q: quit ";
+const HINTS: &str = " C-b hjkl: panes · Tab: tab · type: filter · Esc: clear · C-jk: scroll · C-du: page · C-b z: zoom · w: wrap · C-r: refresh · C-g/C-b q: quit ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
@@ -133,6 +133,8 @@ struct DiffView {
     /// Inner width at the last draw / at the last render request.
     width: u16,
     req_width: u16,
+    /// Long lines wrap onto extra rows instead of ending in "→" (toggled with `w`).
+    wrap: bool,
 }
 
 /// Everything read from git; lists are rebuilt from it on each keystroke.
@@ -163,6 +165,7 @@ struct Req {
     gen: u64,
     target: Target,
     width: u16,
+    wrap: bool,
     root: String,
 }
 
@@ -531,7 +534,7 @@ fn header_lines(raw: &str, ad: &str, cd: &str, refs: &str) -> Vec<Line<'static>>
     lines
 }
 
-fn render_diff(root: &str, target: &Target, width: u16) -> Vec<Line<'static>> {
+fn render_diff(root: &str, target: &Target, width: u16, wrap: bool) -> Vec<Line<'static>> {
     let non_empty = |s: String| (!s.trim().is_empty()).then_some(s);
     // A commit: git's own coloured header (commit/Author/Date/message) as-is,
     // then its patch side by side — what delta did with `git show` output.
@@ -540,7 +543,7 @@ fn render_diff(root: &str, target: &Target, width: u16) -> Vec<Line<'static>> {
         let patch = git(root, &["show", "--no-color", "--format=", rev]);
         if !patch.trim().is_empty() {
             lines.push(Line::default());
-            lines.extend(diff::render(&patch, width));
+            lines.extend(diff::render(&patch, width, wrap));
         }
         lines
     };
@@ -551,7 +554,7 @@ fn render_diff(root: &str, target: &Target, width: u16) -> Vec<Line<'static>> {
             let patch = git(root, &["stash", "show", "-p", "--include-untracked", "--no-color", s]);
             if !patch.trim().is_empty() {
                 lines.push(Line::default());
-                lines.extend(diff::render(&patch, width));
+                lines.extend(diff::render(&patch, width, wrap));
             }
             lines
         }
@@ -567,10 +570,10 @@ fn render_diff(root: &str, target: &Target, width: u16) -> Vec<Line<'static>> {
             } else {
                 git(root, &["diff", "--no-color", "--no-index", "--", "/dev/null", p])
             };
-            diff::render(&raw, width)
+            diff::render(&raw, width, wrap)
         }
         Target::Seed => match non_empty(git(root, &["diff", "--no-color", "HEAD"])).or_else(|| non_empty(git(root, &["diff", "--no-color"]))) {
-            Some(raw) => diff::render(&raw, width),
+            Some(raw) => diff::render(&raw, width, wrap),
             None => commit("HEAD"),
         },
     }
@@ -615,7 +618,7 @@ impl App {
             tab: [0; 5],
             zoom: false,
             prefix: None,
-            diff: DiffView { target: Target::Seed, lines: vec![], scroll: 0, props_scroll: 0, height: 1, width: 0, req_width: 0 },
+            diff: DiffView { target: Target::Seed, lines: vec![], scroll: 0, props_scroll: 0, height: 1, width: 0, req_width: 0, wrap: false },
             rects: vec![],
             req,
             gen: 0,
@@ -813,7 +816,7 @@ impl App {
         }
         self.gen += 1;
         self.diff.req_width = self.diff.width;
-        let _ = self.req.send(Req { gen: self.gen, target: self.diff.target.clone(), width: self.diff.width, root: self.root.clone() });
+        let _ = self.req.send(Req { gen: self.gen, target: self.diff.target.clone(), width: self.diff.width, wrap: self.diff.wrap, root: self.root.clone() });
     }
 
     fn set_zoom(&mut self, on: bool) {
@@ -884,6 +887,11 @@ impl App {
             KeyCode::PageUp => -(d.height as isize),
             KeyCode::Char('g') | KeyCode::Home => isize::MIN / 2,
             KeyCode::Char('G') | KeyCode::End => isize::MAX / 2,
+            KeyCode::Char('w') if !ctrl => {
+                d.wrap = !d.wrap;
+                self.request_diff();
+                return;
+            }
             _ => return,
         };
         let (len, scroll) = if props { (self.data.props.len(), &mut d.props_scroll) } else { (d.lines.len(), &mut d.scroll) };
@@ -1068,7 +1076,7 @@ fn main() -> io::Result<()> {
         let mut input = String::new();
         io::stdin().read_to_string(&mut input)?;
         let ansi = args.get(3).map(String::as_str) == Some("--ansi");
-        for line in diff::render(&input, width) {
+        for line in diff::render(&input, width, false) {
             let text: String = line
                 .spans
                 .iter()
@@ -1086,7 +1094,7 @@ fn main() -> io::Result<()> {
         std::process::exit(1);
     }
 
-    let (req_tx, res_rx) = spawn_latest(|r: Req| (r.gen, render_diff(&r.root, &r.target, r.width)));
+    let (req_tx, res_rx) = spawn_latest(|r: Req| (r.gen, render_diff(&r.root, &r.target, r.width, r.wrap)));
     let (log_tx, log_rx) = spawn_latest(|r: LogReq| (r.gen, load_log(&r.root, &r.rev)));
     let mut app = App::new(root, req_tx, log_tx);
 
@@ -1310,7 +1318,7 @@ mod tests {
         let stash = selected(&app, Tags).unwrap();
         assert!(stash == Target::Stash("stash@{0}".into()));
         assert!(app.diff.target == stash);
-        let text: String = render_diff(root, &stash, 120).iter().flat_map(|l| l.spans.iter().map(|s| s.content.to_string())).collect();
+        let text: String = render_diff(root, &stash, 120, false).iter().flat_map(|l| l.spans.iter().map(|s| s.content.to_string())).collect();
         assert!(text.contains("two"), "stash patch missing");
         key(&mut app, KeyCode::Tab);
         assert_eq!(app.lists[Tags.idx()].query, "v1");

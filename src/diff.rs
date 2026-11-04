@@ -487,6 +487,8 @@ struct Hunk {
 
 struct Renderer {
     width: usize,
+    /// Wrap long lines onto continuation rows instead of truncating them with "→".
+    wrap: bool,
     out: Vec<Line<'static>>,
     syntax: &'static SyntaxReference,
     hunk: Option<Hunk>,
@@ -522,10 +524,32 @@ impl Renderer {
     fn row(&mut self, left: Cell, right: Cell) {
         let lw = self.width / 2;
         let rw = self.width - lw;
-        let mut spans = vec![];
-        push_cell(&mut spans, left, lw, true);
-        push_cell(&mut spans, right, rw, false);
-        self.out.push(Line::from(spans));
+        if !self.wrap {
+            let mut spans = vec![];
+            push_cell(&mut spans, left, lw, true);
+            push_cell(&mut spans, right, rw, false);
+            self.out.push(Line::from(spans));
+            return;
+        }
+        // Wrapped: each side cut to its text width; the number shows on the first
+        // row only and the shorter side is padded with blank rows of its kind.
+        let text_w = |n: Option<usize>, panel: usize| panel.saturating_sub(2 + center4(n).len()).max(1);
+        let (lk, ln, rk, rn) = (left.kind, left.num, right.kind, right.num);
+        let mut l_rows = split_width(left.spans, text_w(ln, lw)).into_iter();
+        let mut r_rows = split_width(right.spans, text_w(rn, rw)).into_iter();
+        let mut first = true;
+        loop {
+            let (l, r) = (l_rows.next(), r_rows.next());
+            if l.is_none() && r.is_none() {
+                break;
+            }
+            let num = |n: Option<usize>| if first { n } else { None };
+            let mut spans = vec![];
+            push_cell(&mut spans, Cell { kind: lk, num: num(ln), spans: l.unwrap_or_default() }, lw, true);
+            push_cell(&mut spans, Cell { kind: rk, num: num(rn), spans: r.unwrap_or_default() }, rw, false);
+            self.out.push(Line::from(spans));
+            first = false;
+        }
     }
 
     fn file_header(&mut self) {
@@ -807,10 +831,12 @@ impl Renderer {
     }
 }
 
-/// Render a plain unified diff side by side at `width` columns.
-pub fn render(diff: &str, width: u16) -> Vec<Line<'static>> {
+/// Render a plain unified diff side by side at `width` columns; `wrap` breaks
+/// long lines onto extra rows instead of truncating them.
+pub fn render(diff: &str, width: u16, wrap: bool) -> Vec<Line<'static>> {
     let mut r = Renderer {
         width: width.max(14) as usize,
+        wrap,
         out: vec![],
         syntax: assets().syntaxes.find_syntax_plain_text(),
         hunk: None,
@@ -852,6 +878,20 @@ mod tests {
     fn leaves_dissimilar_lines_unpaired() {
         let (_, _, rows) = infer_edits(&["completely different line here"], &["zzz qqq www"]);
         assert_eq!(rows, vec![(Some(0), None), (None, Some(0))]);
+    }
+
+    #[test]
+    fn wrap_breaks_long_lines_into_rows_of_the_panel_width() {
+        let long = "x".repeat(50);
+        let patch = format!("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-{long}\n+{long}y\n");
+        let text = |l: &Line| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        let cut = render(&patch, 40, false);
+        let wrapped = render(&patch, 40, true);
+        assert!(cut.iter().any(|l| text(l).contains('→')));
+        assert!(wrapped.iter().all(|l| !text(l).contains('→') && UnicodeWidthStr::width(text(l).as_str()) <= 40));
+        assert!(wrapped.len() > cut.len());
+        let xs = |ls: &[Line]| ls.iter().map(|l| text(l).matches('x').count()).sum::<usize>();
+        assert_eq!(xs(&wrapped), 100); // nothing dropped on either side
     }
 
     #[test]
