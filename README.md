@@ -23,6 +23,12 @@ with the working-tree row. A hash that only lives on another local branch moves
 the branches pane there, so the commit sits in its own history. The
 log's first row, "Working Tree/Index", shows the uncommitted diff.
 
+Three panes have tabs, switched with `Tab`: branches (local / remote, the log
+follows either; a hash only on a remote branch moves there), tags (tags /
+stashes, a stash showing its patch) and diff (diff / properties: the remotes
+and the repo's local git config, with credentials in URLs, tokens and auth
+headers masked).
+
 A commit's diff opens with its whole object header (tree, parents, author,
 committer, signature, …), dates also shown readable and the signature folded to
 one line (named, not verified).
@@ -37,7 +43,8 @@ comparison.
 
 | key | action |
 |---|---|
-| `C-b h/j/k/l`, `C-w h/j/k/l`, `Tab` | move between panes |
+| `C-b h/j/k/l`, `C-w h/j/k/l` | move between panes |
+| `Tab` | next tab of the focused pane |
 | `⇧J/K`, `C-j/k`, arrows | move the list / scroll the diff |
 | `⇧H/L` | first / last row |
 | `C-d`/`C-u` | half page |

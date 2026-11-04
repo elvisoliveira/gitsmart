@@ -11,8 +11,9 @@
 //! Lists filter as you type (lowercase); ⇧J/K, C-j/k and arrows move, ⇧H/L jump
 //! to first/last, C-d/u half-page. Moving through a list updates the diff;
 //! moving through branches also points the log at that branch.
-//! C-b or C-w then h/j/k/l switch panes, Tab cycles, C-b z zooms the pane, C-r
-//! reloads, C-g / C-b q quit.
+//! C-b or C-w then h/j/k/l switch panes, Tab switches the pane's tab (branches:
+//! local/remote, tags: tags/stashes, diff: diff/properties), C-b z zooms the
+//! pane, C-r reloads, C-g / C-b q quit.
 //! Needs only `git`: the side-by-side diff is rendered in-process (diff.rs).
 
 mod diff;
@@ -41,7 +42,7 @@ const SEL_FG: Color = Color::Indexed(254);
 const POINTER: Color = Color::Indexed(161);
 const PROMPT: Color = Color::Indexed(110);
 const INFO: Color = Color::Indexed(144);
-const HINTS: &str = " C-b hjkl: panes · type: filter · Esc: clear · C-jk: scroll · C-du: page · C-b z: zoom · C-r: refresh · C-g/C-b q: quit ";
+const HINTS: &str = " C-b hjkl: panes · Tab: tab · type: filter · Esc: clear · C-jk: scroll · C-du: page · C-b z: zoom · C-r: refresh · C-g/C-b q: quit ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
@@ -53,17 +54,20 @@ enum Pane {
 }
 use Pane::*;
 
-/// Tab order.
 const ORDER: [Pane; 5] = [Worktree, Log, Branches, Tags, Diff];
+/// `lists` slots of the second tabs (the first tab of a pane uses `p.idx()`).
+const REMOTES: usize = 4;
+const STASHES: usize = 5;
 
 impl Pane {
-    fn title(self) -> &'static str {
+    /// Tab names; Tab cycles them. The first one is the pane's title.
+    fn tabs(self) -> &'static [&'static str] {
         match self {
-            Worktree => "working tree",
-            Log => "log",
-            Branches => "branches",
-            Tags => "tags",
-            Diff => "diff",
+            Worktree => &["working tree"],
+            Log => &["log"],
+            Branches => &["local", "remote"],
+            Tags => &["tags", "stashes"],
+            Diff => &["diff", "properties"],
         }
     }
     fn idx(self) -> usize {
@@ -78,6 +82,8 @@ enum Target {
     Seed,
     File(String),
     Commit(String),
+    /// `stash@{n}`: a merge commit, so its patch comes from `git stash show`.
+    Stash(String),
 }
 
 struct Row {
@@ -121,6 +127,8 @@ struct DiffView {
     target: Target,
     lines: Vec<Line<'static>>,
     scroll: usize,
+    /// Scroll of the properties tab, kept apart from the diff's.
+    props_scroll: usize,
     height: usize,
     /// Inner width at the last draw / at the last render request.
     width: u16,
@@ -133,7 +141,11 @@ struct Data {
     status: Vec<(String, String)>,
     log: Log,
     branches: Vec<String>,
+    remotes: Vec<String>,
     tags: Vec<String>,
+    stashes: Vec<String>,
+    /// The properties tab: remotes and local config.
+    props: Vec<Line<'static>>,
     /// Checked-out branch ("" when detached).
     current: String,
 }
@@ -163,8 +175,11 @@ struct LogReq {
 struct App {
     root: String,
     data: Data,
-    lists: [List; 4],
+    /// Worktree, log, branches, tags, remote branches, stashes.
+    lists: [List; 6],
     focus: Pane,
+    /// Active tab of each pane, by `idx()`.
+    tab: [usize; 5],
     zoom: bool,
     /// 'b' after C-b, 'w' after C-w: the next h/j/k/l moves between panes.
     prefix: Option<char>,
@@ -172,7 +187,8 @@ struct App {
     rects: Vec<(Pane, Rect)>,
     req: Sender<Req>,
     gen: u64,
-    /// Branch whose history the log shows; None = HEAD. Follows the branches pane.
+    /// Full ref (`refs/heads/x`, `refs/remotes/o/x`) whose history the log
+    /// shows; None = HEAD. Follows the branches pane.
     log_ref: Option<String>,
     log_req: Sender<LogReq>,
     log_gen: u64,
@@ -292,8 +308,64 @@ fn load(root: &str) -> Data {
         .collect()
     };
 
+    // Symrefs (origin/HEAD, short-named just "origin") come out as empty lines.
+    let remotes = git(root, &["for-each-ref", "--sort=-creatordate", "--format=%(if)%(symref)%(then)%(else)%(refname:short)%(end)", "refs/remotes"])
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
+    let stashes = git(root, &["stash", "list", "--format=%gd %s"]).lines().map(String::from).collect();
     let current = git(root, &["branch", "--show-current"]).trim().to_string();
-    Data { status, log: load_log(root, "HEAD"), branches: refs("refs/heads"), tags: refs("refs/tags"), current }
+    Data {
+        status,
+        log: load_log(root, "HEAD"),
+        branches: refs("refs/heads"),
+        remotes,
+        tags: refs("refs/tags"),
+        stashes,
+        props: props_lines(root),
+        current,
+    }
+}
+
+/// `git remote -v` and `git config --local --list`, credentials masked.
+fn props_lines(root: &str) -> Vec<Line<'static>> {
+    let head = |s: &str| Line::styled(s.to_string(), Style::new().fg(PROMPT).add_modifier(Modifier::BOLD));
+    let mut lines = vec![head("remotes")];
+    let remotes = git(root, &["remote", "-v"]);
+    // Tabs would break the cell grid.
+    lines.extend(remotes.lines().map(|l| Line::raw(format!("  {}", mask_url(l).replace('\t', "  ")))));
+    if remotes.trim().is_empty() {
+        lines.push(Line::raw("  (none)"));
+    }
+    lines.push(Line::default());
+    lines.push(head("config (local)"));
+    for l in git(root, &["config", "--local", "--list"]).lines() {
+        let (k, v) = l.split_once('=').unwrap_or((l, ""));
+        lines.push(Line::from(vec![Span::raw("  "), Span::styled(k.to_string(), Style::new().fg(INFO)), Span::raw(format!(" = {}", mask(k, v)))]));
+    }
+    lines
+}
+
+/// Config values that are secrets as a whole (tokens, auth headers).
+fn mask(key: &str, value: &str) -> String {
+    let k = key.to_lowercase();
+    if ["extraheader", "token", "password", "secret"].iter().any(|w| k.contains(w)) {
+        return "***".into();
+    }
+    mask_url(value)
+}
+
+/// `https://user:token@host/...` → `https://***@host/...`. ssh's `user@` (no
+/// password) stays.
+fn mask_url(s: &str) -> String {
+    let Some(i) = s.find("://") else { return s.to_string() };
+    let rest = &s[i + 3..];
+    let end = rest.find(['/', ' ', '\t']).unwrap_or(rest.len());
+    match rest[..end].rfind('@') {
+        Some(at) if rest[..at].contains(':') || s[..i].starts_with("http") => format!("{}://***{}", &s[..i], &rest[at..]),
+        _ => s.to_string(),
+    }
 }
 
 #[derive(Default)]
@@ -474,6 +546,15 @@ fn render_diff(root: &str, target: &Target, width: u16) -> Vec<Line<'static>> {
     };
     match target {
         Target::Commit(h) => commit(h),
+        Target::Stash(s) => {
+            let mut lines = commit_header(root, s);
+            let patch = git(root, &["stash", "show", "-p", "--include-untracked", "--no-color", s]);
+            if !patch.trim().is_empty() {
+                lines.push(Line::default());
+                lines.extend(diff::render(&patch, width));
+            }
+            lines
+        }
         Target::File(p) => {
             let tracked = Command::new("git")
                 .args(["-C", root, "ls-files", "--error-unmatch", "--", p])
@@ -529,11 +610,12 @@ impl App {
         let mut app = App {
             root,
             data: Data::default(),
-            lists: [List::new(false, "▶", " "), List::new(true, "▌", "▌"), List::new(true, "▌", "▌"), List::new(true, "▌", "▌")],
+            lists: [List::new(false, "▶", " "), List::new(true, "▌", "▌"), List::new(true, "▌", "▌"), List::new(true, "▌", "▌"), List::new(true, "▌", "▌"), List::new(true, "▌", "▌")],
             focus: Worktree,
+            tab: [0; 5],
             zoom: false,
             prefix: None,
-            diff: DiffView { target: Target::Seed, lines: vec![], scroll: 0, height: 1, width: 0, req_width: 0 },
+            diff: DiffView { target: Target::Seed, lines: vec![], scroll: 0, props_scroll: 0, height: 1, width: 0, req_width: 0 },
             rects: vec![],
             req,
             gen: 0,
@@ -551,13 +633,19 @@ impl App {
         self.data = load(&self.root);
         self.log_ref = None;
         self.log_gen += 1; // drop a branch log still loading
+        let tabs = self.tab;
         for p in [Worktree, Log, Branches, Tags] {
-            self.lists[p.idx()].query.clear();
-            self.rebuild(p);
-            let l = &mut self.lists[p.idx()];
-            l.focused = l.current().map(|r| r.plain.clone());
+            for t in 0..p.tabs().len() {
+                self.tab[p.idx()] = t;
+                let i = self.li(p);
+                self.lists[i].query.clear();
+                self.rebuild(p);
+                let l = &mut self.lists[i];
+                l.focused = l.current().map(|r| r.plain.clone());
+            }
         }
-        let current = self.data.current.clone();
+        self.tab = tabs;
+        let current = format!("refs/heads/{}", self.data.current);
         self.point_branches_at(&current);
         // The diff opens on the first worktree row if it is a file, else on the
         // whole working-tree diff (HEAD when clean). Log/branches/tags don't
@@ -566,8 +654,18 @@ impl App {
         self.request_diff();
     }
 
+    /// `lists` slot of the pane's active tab.
+    fn li(&self, p: Pane) -> usize {
+        match (p, self.tab[p.idx()]) {
+            (Branches, 1) => REMOTES,
+            (Tags, 1) => STASHES,
+            _ => p.idx(),
+        }
+    }
+
     fn rebuild(&mut self, p: Pane) {
-        let q = self.lists[p.idx()].query.clone();
+        let i = self.li(p);
+        let q = self.lists[i].query.clone();
         let (rows, total) = match p {
             Worktree => (worktree_rows(&self.data.status, &q), 0),
             Log => {
@@ -596,11 +694,21 @@ impl App {
                 }
                 (rows, 0)
             }
+            Branches if i == REMOTES => (ref_rows(&self.data.remotes, &q, ""), self.data.remotes.len()),
             Branches => (ref_rows(&self.data.branches, &q, &self.data.current), self.data.branches.len()),
+            Tags if i == STASHES => {
+                let mut rows = ref_rows(&self.data.stashes, &q, "");
+                for r in &mut rows {
+                    if let Some(Target::Commit(s)) = r.target.take() {
+                        r.target = Some(Target::Stash(s));
+                    }
+                }
+                (rows, self.data.stashes.len())
+            }
             Tags => (ref_rows(&self.data.tags, &q, ""), self.data.tags.len()),
             Diff => return,
         };
-        let l = &mut self.lists[p.idx()];
+        let l = &mut self.lists[i];
         l.total = if total == 0 { rows.len() } else { total };
         l.rows = rows;
         l.cursor = 0;
@@ -609,7 +717,8 @@ impl App {
 
     /// fzf `focus`: when the row under the cursor changed, point the diff at it.
     fn follow(&mut self, p: Pane) {
-        let l = &mut self.lists[p.idx()];
+        let i = self.li(p);
+        let l = &mut self.lists[i];
         let cur = l.current().map(|r| r.plain.clone());
         if cur == l.focused {
             return;
@@ -622,21 +731,22 @@ impl App {
             }
         }
         if let (Branches, Some(b)) = (p, cur) {
-            self.show_log_of(&b, false);
+            let kind = if i == REMOTES { "remotes" } else { "heads" };
+            self.show_log_of(&format!("refs/{kind}/{b}"), false);
         }
     }
 
-    /// Point the log at a branch: the checked-out one means HEAD (with the
-    /// working-tree row). Async while navigating branches; sync for a hash
-    /// search, which needs the rows right away.
-    fn show_log_of(&mut self, branch: &str, now: bool) {
-        let r = (branch != self.data.current).then(|| branch.to_string());
+    /// Point the log at a branch (full ref): the checked-out one means HEAD
+    /// (with the working-tree row). Async while navigating branches; sync for a
+    /// hash search, which needs the rows right away.
+    fn show_log_of(&mut self, full: &str, now: bool) {
+        let r = (full != format!("refs/heads/{}", self.data.current)).then(|| full.to_string());
         if r == self.log_ref {
             return;
         }
         self.log_ref = r;
         self.log_gen += 1;
-        let rev = self.log_ref.as_ref().map_or("HEAD".to_string(), |b| format!("refs/heads/{b}"));
+        let rev = self.log_ref.clone().unwrap_or_else(|| "HEAD".into());
         if now {
             self.data.log = load_log(&self.root, &rev);
         } else {
@@ -655,24 +765,45 @@ impl App {
         l.focused = l.current().map(|r| r.plain.clone());
     }
 
-    /// Local branch holding a commit: the checked-out one if it does, else the
-    /// most recent (the branches pane's order).
+    /// Branch holding a commit, as a full ref: the checked-out one if it does,
+    /// else the most recent local one (the branches pane's order), else the
+    /// most recent remote one.
     fn branch_containing(&self, rev: &str) -> Option<String> {
-        let has: HashSet<String> = git(&self.root, &["for-each-ref", "--contains", rev, "--format=%(refname:short)", "refs/heads"]).lines().map(String::from).collect();
+        let has: HashSet<String> = git(&self.root, &["for-each-ref", "--contains", rev, "--format=%(refname)", "refs/heads", "refs/remotes"]).lines().map(String::from).collect();
         let d = &self.data;
-        if has.contains(&d.current) {
-            return Some(d.current.clone());
+        let local = |b: &str| format!("refs/heads/{b}");
+        if has.contains(&local(&d.current)) {
+            return Some(local(&d.current));
         }
-        d.branches.iter().map(|l| strip_ansi(l)).find(|b| has.contains(b))
+        let remotes = d.remotes.iter().map(|b| format!("refs/remotes/{b}"));
+        d.branches.iter().map(|l| local(&strip_ansi(l))).chain(remotes).find(|b| has.contains(b))
     }
 
-    /// Put the branches cursor on a branch without moving the diff (no-op when
-    /// it is filtered out).
-    fn point_branches_at(&mut self, branch: &str) {
-        let l = &mut self.lists[Branches.idx()];
-        if let Some(i) = l.rows.iter().position(|r| r.plain == branch) {
+    /// Put the branches cursor on a branch (full ref), on its tab, without
+    /// moving the diff (no-op when it is filtered out).
+    fn point_branches_at(&mut self, full: &str) {
+        let (tab, slot, name) = match full.strip_prefix("refs/remotes/") {
+            Some(n) => (1, REMOTES, n),
+            None => (0, Branches.idx(), full.strip_prefix("refs/heads/").unwrap_or(full)),
+        };
+        let l = &mut self.lists[slot];
+        if let Some(i) = l.rows.iter().position(|r| r.plain == name) {
             l.cursor = i;
-            l.focused = Some(branch.to_string());
+            l.focused = Some(name.to_string());
+            self.tab[Branches.idx()] = tab;
+        }
+    }
+
+    /// Tab: the focused pane's next tab. The diff follows the row under the
+    /// cursor there (and the log, on the branches tabs).
+    fn next_tab(&mut self) {
+        let p = self.focus;
+        let n = p.tabs().len();
+        self.tab[p.idx()] = (self.tab[p.idx()] + 1) % n;
+        if n > 1 && p != Diff {
+            let i = self.li(p);
+            self.lists[i].focused = None;
+            self.follow(p);
         }
     }
 
@@ -687,11 +818,6 @@ impl App {
 
     fn set_zoom(&mut self, on: bool) {
         self.zoom = on;
-    }
-
-    fn select(&mut self, p: Pane) {
-        self.set_zoom(false); // moving off a zoomed pane unzooms it
-        self.focus = p;
     }
 
     /// Spatial pane move; wraps around at the edge.
@@ -739,13 +865,14 @@ impl App {
             KeyCode::Char('w') if ctrl => self.prefix = Some('w'),
             KeyCode::Char('g') if ctrl => self.quit = true,
             KeyCode::Char('r') if ctrl => self.reset(),
-            KeyCode::Tab => self.select(ORDER[(self.focus.idx() + 1) % ORDER.len()]),
+            KeyCode::Tab => self.next_tab(),
             _ if self.focus == Diff => self.diff_key(k.code, ctrl),
             _ => self.list_key(k.code, ctrl),
         }
     }
 
     fn diff_key(&mut self, code: KeyCode, ctrl: bool) {
+        let props = self.tab[Diff.idx()] == 1;
         let d = &mut self.diff;
         let half = (d.height / 2).max(1) as isize;
         let delta: isize = match code {
@@ -759,13 +886,15 @@ impl App {
             KeyCode::Char('G') | KeyCode::End => isize::MAX / 2,
             _ => return,
         };
-        let max = d.lines.len().saturating_sub(d.height) as isize;
-        d.scroll = (d.scroll as isize).saturating_add(delta).clamp(0, max) as usize;
+        let (len, scroll) = if props { (self.data.props.len(), &mut d.props_scroll) } else { (d.lines.len(), &mut d.scroll) };
+        let max = len.saturating_sub(d.height) as isize;
+        *scroll = (*scroll as isize).saturating_add(delta).clamp(0, max) as usize;
     }
 
     fn list_key(&mut self, code: KeyCode, ctrl: bool) {
         let p = self.focus;
-        let l = &mut self.lists[p.idx()];
+        let i = self.li(p);
+        let l = &mut self.lists[i];
         let half = (l.height / 2).max(1) as isize;
         let cur = l.cursor as isize;
         match code {
@@ -790,7 +919,7 @@ impl App {
                 let (query, cursor) = (std::mem::take(&mut l.query), l.cursor);
                 let sel = l.current().map(|r| (r.target.clone(), r.plain.clone()));
                 self.rebuild(p);
-                let l = &mut self.lists[p.idx()];
+                let l = &mut self.lists[i];
                 let found = sel.map(|(target, plain)| l.rows.iter().position(|r| if target.is_some() { r.target == target } else { r.plain == plain }));
                 match found {
                     Some(Some(i)) => l.cursor = i,
@@ -799,7 +928,7 @@ impl App {
                     Some(None) => {
                         l.query = query;
                         self.rebuild(p);
-                        self.lists[p.idx()].cursor = cursor;
+                        self.lists[i].cursor = cursor;
                     }
                     None => {}
                 }
@@ -824,15 +953,33 @@ impl App {
             }
             let style = Style::new().fg(if active { ACTIVE } else { BORDER });
             let title = match (p, &self.log_ref) {
-                (Log, Some(b)) => format!(" log · {b} "),
-                _ => format!(" {} ", p.title()),
+                (Log, Some(b)) => {
+                    let b = b.strip_prefix("refs/heads/").or_else(|| b.strip_prefix("refs/remotes/")).unwrap_or(b);
+                    Line::styled(format!(" log · {b} "), style)
+                }
+                // Tabs: the active one bold and underlined.
+                _ => {
+                    let mut spans = vec![Span::styled(" ", style)];
+                    for (t, name) in p.tabs().iter().enumerate() {
+                        if t > 0 {
+                            spans.push(Span::styled(" │ ", style));
+                        }
+                        let on = t == self.tab[p.idx()] && p.tabs().len() > 1;
+                        spans.push(Span::styled(*name, if on { style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED) } else { style }));
+                    }
+                    spans.push(Span::styled(" ", style));
+                    Line::from(spans)
+                }
             };
-            let block = Block::new().borders(borders).border_style(style).title(Span::styled(title, style));
+            let block = Block::new().borders(borders).border_style(style).title(title);
             let inner = block.inner(r);
             f.render_widget(block, r);
             match p {
                 Diff => self.draw_diff(f, inner),
-                _ => draw_list(f, inner, &mut self.lists[p.idx()], active),
+                _ => {
+                    let i = self.li(p);
+                    draw_list(f, inner, &mut self.lists[i], active)
+                }
             }
         }
         let bar = Style::new().bg(STATUS_BG).fg(STATUS_FG);
@@ -844,8 +991,9 @@ impl App {
         let d = &mut self.diff;
         d.width = area.width;
         d.height = area.height as usize;
-        d.scroll = d.scroll.min(d.lines.len().saturating_sub(d.height));
-        let lines: Vec<Line> = d.lines.iter().skip(d.scroll).take(d.height).cloned().collect();
+        let (src, scroll) = if self.tab[Diff.idx()] == 1 { (&self.data.props, &mut d.props_scroll) } else { (&d.lines, &mut d.scroll) };
+        *scroll = (*scroll).min(src.len().saturating_sub(d.height));
+        let lines: Vec<Line> = src.iter().skip(*scroll).take(d.height).cloned().collect();
         f.render_widget(Paragraph::new(lines), area);
     }
 }
@@ -1012,7 +1160,7 @@ mod tests {
     }
 
     fn selected(app: &App, p: Pane) -> Option<Target> {
-        app.lists[p.idx()].current().and_then(|r| r.target.clone())
+        app.lists[app.li(p)].current().and_then(|r| r.target.clone())
     }
 
     #[test]
@@ -1097,18 +1245,79 @@ mod tests {
         assert!(app.log_ref.is_none());
         app.focus = Log;
         typed(&mut app, &hash[..9]);
-        assert_eq!(app.log_ref.as_deref(), Some("other"));
+        assert_eq!(app.log_ref.as_deref(), Some("refs/heads/other"));
         assert!(selected(&app, Branches) == Some(Target::Commit("other".into())));
         key(&mut app, KeyCode::Esc);
         assert!(app.lists[Log.idx()].query.is_empty());
         assert!(selected(&app, Log) == Some(Target::Commit(hash[..12].into())));
 
         // Back on the checked-out branch: the log is HEAD again, working tree on top.
-        app.point_branches_at("main");
-        app.show_log_of("main", true);
+        app.point_branches_at("refs/heads/main");
+        app.show_log_of("refs/heads/main", true);
         app.rebuild(Log);
         assert!(app.log_ref.is_none());
         assert!(selected(&app, Log) == Some(Target::Seed));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn masks_credentials_in_properties() {
+        assert_eq!(mask_url("origin\thttps://me:tok@github.com/x (fetch)"), "origin\thttps://***@github.com/x (fetch)");
+        assert_eq!(mask_url("https://tok@github.com/x"), "https://***@github.com/x");
+        assert_eq!(mask_url("ssh://git@host/x"), "ssh://git@host/x");
+        assert_eq!(mask_url("git@github.com:me/x"), "git@github.com:me/x");
+        assert_eq!(mask("http.https://github.com/.extraheader", "AUTHORIZATION: basic abc"), "***");
+        assert_eq!(mask("core.bare", "false"), "false");
+    }
+
+    /// Tab switches tabs (never panes); each tab keeps its filter; remote
+    /// branches drive the log; a stash shows its patch.
+    #[test]
+    fn tabs_remote_branches_and_stashes() {
+        let dir = std::env::temp_dir().join(format!("gitsmart-tabs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.to_str().unwrap();
+        let run = |args: &[&str]| {
+            let ok = Command::new("git").arg("-C").arg(root).args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]).args(args)
+                .stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap().success();
+            assert!(ok, "git {args:?}");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("f"), "one\n").unwrap();
+        run(&["add", "f"]);
+        run(&["commit", "-q", "-m", "base"]);
+        run(&["update-ref", "refs/remotes/origin/feat", "HEAD"]);
+        run(&["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/feat"]);
+        std::fs::write(dir.join("f"), "two\n").unwrap();
+        run(&["stash", "-q"]);
+        run(&["tag", "v1"]);
+
+        let mut app = app(root);
+        assert_eq!(app.data.remotes, ["origin/feat"]); // origin/HEAD left out
+        app.focus = Branches;
+        key(&mut app, KeyCode::Tab);
+        assert!(app.focus == Branches);
+        assert_eq!(app.tab[Branches.idx()], 1);
+        assert_eq!(app.log_ref.as_deref(), Some("refs/remotes/origin/feat"));
+        key(&mut app, KeyCode::Tab);
+        assert!(app.log_ref.is_none()); // back on local main = HEAD
+
+        app.focus = Tags;
+        typed(&mut app, "v1");
+        key(&mut app, KeyCode::Tab);
+        assert!(app.lists[STASHES].query.is_empty());
+        let stash = selected(&app, Tags).unwrap();
+        assert!(stash == Target::Stash("stash@{0}".into()));
+        assert!(app.diff.target == stash);
+        let text: String = render_diff(root, &stash, 120).iter().flat_map(|l| l.spans.iter().map(|s| s.content.to_string())).collect();
+        assert!(text.contains("two"), "stash patch missing");
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.lists[Tags.idx()].query, "v1");
+
+        app.focus = Diff;
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab[Diff.idx()], 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
